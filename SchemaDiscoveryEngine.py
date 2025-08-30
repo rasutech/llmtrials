@@ -1,914 +1,754 @@
+import pandas as pd
 import re
 import json
-import sqlparse
-from sqlparse.sql import IdentifierList, Identifier, Where, Comparison
-from sqlparse.tokens import Keyword, DML
-from collections import defaultdict, Counter
 from typing import Dict, List, Set, Tuple, Optional, Any
-import pandas as pd
-import numpy as np
 from dataclasses import dataclass, field
-import networkx as nx
-import matplotlib.pyplot as plt
-from datetime import datetime
-import hashlib
-import requests
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import defaultdict, Counter
+import numpy as np
+from datetime import datetime, timedelta
 import logging
-from abc import ABC, abstractmethod
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import networkx as nx
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# Import your LLM wrapper
+from ollama_wrapper import answer_from_ollama
+
 logger = logging.getLogger(__name__)
 
 @dataclass
-class Column:
-    """Represents a database column with its properties"""
-    name: str
-    table: str
-    data_type: Optional[str] = None
-    is_primary_key: bool = False
-    is_foreign_key: bool = False
-    references_table: Optional[str] = None
-    references_column: Optional[str] = None
-    is_nullable: bool = True
-    has_index: bool = False
-
-@dataclass
-class Table:
-    """Represents a database table with discovered properties"""
-    name: str
-    columns: Dict[str, Column] = field(default_factory=dict)
-    primary_keys: Set[str] = field(default_factory=set)
-    foreign_keys: Dict[str, Tuple[str, str]] = field(default_factory=dict)  # column -> (ref_table, ref_column)
-    relationships: List['TableRelationship'] = field(default_factory=list)
-    row_count_estimate: Optional[int] = None
-    usage_frequency: int = 0
-    operation_types: Counter = field(default_factory=Counter)
-
-@dataclass
-class TableRelationship:
-    """Enhanced relationship with discovered properties"""
-    source_table: str
-    target_table: str
-    join_columns: List[Tuple[str, str]]  # [(source_col, target_col)]
-    relationship_type: str  # 'one-to-one', 'one-to-many', 'many-to-many'
+class DynamicIntegrityRule:
+    """Represents a dynamically discovered integrity rule"""
+    rule_id: str
+    rule_name: str
+    description: str
+    affected_tables: List[str]
+    check_pattern: str
+    fix_pattern: Optional[str]
+    example_check_sql: str
+    example_fix_sql: Optional[str]
+    severity: str  # 'critical', 'high', 'medium', 'low'
+    frequency: int
     confidence: float
-    discovery_method: str  # 'join', 'foreign_key', 'naming_convention', 'llm_inference'
-    sample_queries: List[str] = field(default_factory=list)
+    business_impact: str
 
-class SchemaDiscoveryEngine:
-    """Dynamically discovers database schema from SQL statements"""
+@dataclass
+class TableProfile:
+    """Profile of a discovered table based on SQL usage"""
+    name: str
+    columns: Set[str]
+    primary_operations: Counter  # SELECT, INSERT, UPDATE, DELETE counts
+    relationship_tables: Set[str]
+    integrity_check_frequency: int
+    integrity_fix_frequency: int
+    common_join_columns: Dict[str, int]
+    estimated_importance: float
+
+class AdaptiveRuleGenerator:
+    """Generates integrity rules based on discovered patterns"""
     
-    def __init__(self):
-        self.tables: Dict[str, Table] = {}
-        self.relationships: List[TableRelationship] = []
-        self.column_patterns = self._compile_patterns()
-        self.naming_conventions = self._detect_naming_conventions()
+    def __init__(self, vsql_analyzer, llm_model: str = "qwen3:30b"):
+        self.analyzer = vsql_analyzer
+        self.llm_model = llm_model
+        self.table_profiles = {}
+        self.discovered_rules = []
+        self.pattern_library = self._initialize_pattern_library()
         
-    def _compile_patterns(self) -> Dict[str, re.Pattern]:
-        """Compile regex patterns for schema discovery"""
+    def _initialize_pattern_library(self) -> Dict[str, Any]:
+        """Initialize library of known integrity patterns"""
         return {
-            'foreign_key': re.compile(r'(\w+)_id$', re.IGNORECASE),
-            'primary_key': re.compile(r'^id$|_id$|(\w+)_pk$', re.IGNORECASE),
-            'create_table': re.compile(r'CREATE\s+TABLE\s+(\w+)\s*\((.*?)\)', re.IGNORECASE | re.DOTALL),
-            'alter_table': re.compile(r'ALTER\s+TABLE\s+(\w+)\s+ADD\s+(?:CONSTRAINT\s+)?(\w+)?\s*FOREIGN\s+KEY\s*\((\w+)\)\s*REFERENCES\s+(\w+)\s*\((\w+)\)', re.IGNORECASE),
-            'index_creation': re.compile(r'CREATE\s+(?:UNIQUE\s+)?INDEX\s+\w+\s+ON\s+(\w+)\s*\(([^)]+)\)', re.IGNORECASE),
-            'join_pattern': re.compile(r'(\w+)\.(\w+)\s*=\s*(\w+)\.(\w+)', re.IGNORECASE),
-            'table_alias': re.compile(r'(\w+)\s+(?:AS\s+)?(\w+)\s+(?:ON|WHERE|JOIN)', re.IGNORECASE)
+            'orphan_patterns': {
+                'check': [
+                    r'SELECT.*FROM\s+(\w+).*NOT\s+IN.*SELECT.*FROM\s+(\w+)',
+                    r'SELECT.*LEFT\s+JOIN.*WHERE.*IS\s+NULL',
+                    r'SELECT.*NOT\s+EXISTS.*SELECT.*FROM'
+                ],
+                'fix': [
+                    r'DELETE.*WHERE.*NOT\s+IN',
+                    r'DELETE.*LEFT\s+JOIN.*WHERE.*IS\s+NULL'
+                ],
+                'description': 'Records referencing non-existent parent records'
+            },
+            'duplicate_patterns': {
+                'check': [
+                    r'SELECT.*COUNT\(\*\).*GROUP\s+BY.*HAVING\s+COUNT.*>\s*1',
+                    r'SELECT.*ROW_NUMBER\(\).*OVER.*PARTITION\s+BY'
+                ],
+                'fix': [
+                    r'DELETE.*WHERE.*ROWID.*NOT\s+IN.*MIN\(ROWID\)',
+                    r'DELETE.*ROW_NUMBER.*>\s*1'
+                ],
+                'description': 'Duplicate records based on business keys'
+            },
+            'circular_patterns': {
+                'check': [
+                    r'WITH\s+RECURSIVE.*SELECT.*CONNECT\s+BY',
+                    r'WITH.*AS.*SELECT.*UNION\s+ALL.*SELECT'
+                ],
+                'fix': [
+                    r'UPDATE.*SET.*=\s*NULL.*WHERE',
+                    r'DELETE.*WHERE.*IN.*WITH\s+RECURSIVE'
+                ],
+                'description': 'Circular references in hierarchical data'
+            },
+            'inconsistent_patterns': {
+                'check': [
+                    r'SELECT.*CASE\s+WHEN.*THEN.*ELSE.*END',
+                    r'SELECT.*WHERE.*<>.*SELECT'
+                ],
+                'fix': [
+                    r'UPDATE.*SET.*=.*CASE\s+WHEN',
+                    r'MERGE.*WHEN\s+MATCHED.*UPDATE'
+                ],
+                'description': 'Data inconsistencies between related records'
+            }
         }
     
-    def _detect_naming_conventions(self) -> Dict[str, Any]:
-        """Detect naming conventions used in the database"""
-        return {
-            'foreign_key_suffixes': ['_id', '_key', '_ref', '_fk'],
-            'primary_key_names': ['id', 'pk', 'oid', 'guid'],
-            'junction_table_indicators': ['_to_', '_x_', '_map', '_link', '_assoc'],
-            'timestamp_columns': ['created_at', 'updated_at', 'modified_date', 'timestamp'],
-            'status_columns': ['status', 'state', 'is_active', 'deleted', 'enabled']
-        }
-    
-    def discover_schema(self, sql_statements: List[str]) -> Dict[str, Table]:
-        """Main method to discover complete schema from SQL statements"""
-        logger.info("Starting dynamic schema discovery...")
+    def profile_tables(self) -> Dict[str, TableProfile]:
+        """Create profiles for all discovered tables"""
+        logger.info("Profiling discovered tables...")
         
-        # Phase 1: Extract tables and columns from all SQL types
-        for i, sql in enumerate(sql_statements):
-            if i % 1000 == 0:
-                logger.info(f"Processing SQL {i}/{len(sql_statements)}")
+        # Analyze each SQL to build table profiles
+        for _, row in self.analyzer.df.iterrows():
+            sql = row['SQL_FULLTEXT']
+            purpose = row.get('purpose', 'unknown')
             
-            try:
-                self._process_sql_statement(sql)
-            except Exception as e:
-                logger.debug(f"Error processing SQL: {e}")
-                continue
-        
-        # Phase 2: Infer relationships from patterns
-        self._infer_relationships()
-        
-        # Phase 3: Detect junction tables and many-to-many relationships
-        self._detect_junction_tables()
-        
-        # Phase 4: Analyze naming patterns for additional relationships
-        self._analyze_naming_patterns()
-        
-        logger.info(f"Discovered {len(self.tables)} tables with {len(self.relationships)} relationships")
-        
-        return self.tables
-    
-    def _process_sql_statement(self, sql: str) -> None:
-        """Process a single SQL statement to extract schema information"""
-        sql_upper = sql.upper()
-        
-        # Handle CREATE TABLE statements
-        create_match = self.column_patterns['create_table'].search(sql)
-        if create_match:
-            self._process_create_table(create_match.group(1), create_match.group(2))
-            return
-        
-        # Handle ALTER TABLE for foreign keys
-        alter_match = self.column_patterns['alter_table'].search(sql)
-        if alter_match:
-            self._process_alter_table(alter_match)
-            return
-        
-        # Parse with sqlparse for other statement types
-        try:
-            parsed = sqlparse.parse(sql)[0]
-            self._extract_from_parsed_sql(parsed)
-        except:
-            # Fallback to regex-based extraction
-            self._extract_tables_from_sql(sql)
-    
-    def _process_create_table(self, table_name: str, columns_def: str) -> None:
-        """Process CREATE TABLE statement"""
-        table_name = table_name.upper()
-        if table_name not in self.tables:
-            self.tables[table_name] = Table(name=table_name)
-        
-        table = self.tables[table_name]
-        
-        # Parse column definitions
-        column_lines = columns_def.split(',')
-        for line in column_lines:
-            line = line.strip()
-            if not line:
-                continue
+            # Extract tables and their usage
+            tables = self._extract_tables_from_sql(sql)
+            operation = self._get_operation_type(sql)
             
-            # Extract column name and properties
-            parts = line.split()
-            if len(parts) >= 2:
-                col_name = parts[0].strip('`"[]').upper()
+            for table in tables:
+                if table not in self.table_profiles:
+                    self.table_profiles[table] = TableProfile(
+                        name=table,
+                        columns=set(),
+                        primary_operations=Counter(),
+                        relationship_tables=set(),
+                        integrity_check_frequency=0,
+                        integrity_fix_frequency=0,
+                        common_join_columns=defaultdict(int),
+                        estimated_importance=0.0
+                    )
                 
-                # Check for PRIMARY KEY
-                if 'PRIMARY KEY' in line.upper():
-                    table.primary_keys.add(col_name)
-                    
-                # Check for FOREIGN KEY
-                fk_match = re.search(r'REFERENCES\s+(\w+)\s*\((\w+)\)', line, re.IGNORECASE)
-                if fk_match:
-                    ref_table = fk_match.group(1).upper()
-                    ref_column = fk_match.group(2).upper()
-                    table.foreign_keys[col_name] = (ref_table, ref_column)
+                profile = self.table_profiles[table]
+                profile.primary_operations[operation] += 1
                 
-                # Add column
-                column = Column(
-                    name=col_name,
-                    table=table_name,
-                    is_primary_key=col_name in table.primary_keys,
-                    is_foreign_key=col_name in table.foreign_keys,
-                    is_nullable='NOT NULL' not in line.upper()
-                )
-                table.columns[col_name] = column
-    
-    def _process_alter_table(self, match: re.Match) -> None:
-        """Process ALTER TABLE statement for foreign keys"""
-        table_name = match.group(1).upper()
-        column_name = match.group(3).upper()
-        ref_table = match.group(4).upper()
-        ref_column = match.group(5).upper()
-        
-        if table_name not in self.tables:
-            self.tables[table_name] = Table(name=table_name)
-        
-        table = self.tables[table_name]
-        table.foreign_keys[column_name] = (ref_table, ref_column)
-        
-        if column_name in table.columns:
-            table.columns[column_name].is_foreign_key = True
-            table.columns[column_name].references_table = ref_table
-            table.columns[column_name].references_column = ref_column
-    
-    def _extract_from_parsed_sql(self, parsed) -> None:
-        """Extract schema information from parsed SQL"""
-        # Get the SQL type
-        sql_type = self._get_statement_type(parsed)
-        
-        # Extract tables based on SQL type
-        if sql_type in ['SELECT', 'UPDATE', 'DELETE', 'INSERT']:
-            tables = self._extract_tables_from_tokens(parsed.tokens)
-            
-            for table_name in tables:
-                table_name = table_name.upper()
-                if table_name not in self.tables:
-                    self.tables[table_name] = Table(name=table_name)
+                if purpose == 'integrity_check':
+                    profile.integrity_check_frequency += 1
+                elif purpose == 'integrity_fix':
+                    profile.integrity_fix_frequency += 1
                 
-                self.tables[table_name].usage_frequency += 1
-                self.tables[table_name].operation_types[sql_type] += 1
+                # Extract columns
+                columns = self._extract_columns_for_table(sql, table)
+                profile.columns.update(columns)
+                
+                # Extract relationships
+                related_tables = self._extract_related_tables(sql, table)
+                profile.relationship_tables.update(related_tables)
+                
+                # Extract join columns
+                join_columns = self._extract_join_columns(sql, table)
+                for col in join_columns:
+                    profile.common_join_columns[col] += 1
         
-        # Extract JOINs for relationships
-        sql_text = str(parsed)
-        join_matches = self.column_patterns['join_pattern'].findall(sql_text)
-        for match in join_matches:
-            self._process_join_condition(match)
+        # Calculate importance scores
+        self._calculate_table_importance()
+        
+        logger.info(f"Profiled {len(self.table_profiles)} tables")
+        return self.table_profiles
     
-    def _get_statement_type(self, parsed) -> str:
-        """Get the type of SQL statement"""
-        for token in parsed.tokens:
-            if token.ttype is DML:
-                return token.value.upper()
-        return 'OTHER'
-    
-    def _extract_tables_from_tokens(self, tokens) -> Set[str]:
-        """Extract table names from SQL tokens"""
+    def _extract_tables_from_sql(self, sql: str) -> Set[str]:
+        """Extract table names from SQL"""
         tables = set()
-        from_seen = False
-        
-        for token in tokens:
-            if token.is_keyword and token.value.upper() in ['FROM', 'JOIN', 'INTO', 'UPDATE']:
-                from_seen = True
-            elif from_seen and isinstance(token, Identifier):
-                table_name = token.get_real_name()
-                if table_name:
-                    tables.add(table_name)
-            elif from_seen and isinstance(token, IdentifierList):
-                for identifier in token.get_identifiers():
-                    table_name = identifier.get_real_name()
-                    if table_name:
-                        tables.add(table_name)
-        
-        return tables
-    
-    def _extract_tables_from_sql(self, sql: str) -> None:
-        """Fallback regex-based table extraction"""
-        # Common patterns for table names
         patterns = [
             r'FROM\s+(\w+)',
             r'JOIN\s+(\w+)',
             r'INTO\s+(\w+)',
             r'UPDATE\s+(\w+)',
-            r'DELETE\s+FROM\s+(\w+)',
-            r'INSERT\s+INTO\s+(\w+)'
+            r'DELETE\s+FROM\s+(\w+)'
         ]
         
         for pattern in patterns:
             matches = re.findall(pattern, sql, re.IGNORECASE)
-            for table_name in matches:
-                table_name = table_name.upper()
-                if table_name not in self.tables:
-                    self.tables[table_name] = Table(name=table_name)
-                self.tables[table_name].usage_frequency += 1
+            tables.update(match.upper() for match in matches)
+        
+        return tables
     
-    def _process_join_condition(self, match: Tuple[str, str, str, str]) -> None:
-        """Process a JOIN condition to track relationships"""
-        t1, c1, t2, c2 = [x.upper() for x in match]
-        
-        # Ensure tables exist
-        for table in [t1, t2]:
-            if table not in self.tables:
-                self.tables[table] = Table(name=table)
-        
-        # Add columns if not exists
-        if c1 not in self.tables[t1].columns:
-            self.tables[t1].columns[c1] = Column(name=c1, table=t1)
-        if c2 not in self.tables[t2].columns:
-            self.tables[t2].columns[c2] = Column(name=c2, table=t2)
-        
-        # Track join relationship
-        self._add_relationship(t1, t2, [(c1, c2)], 'join')
+    def _get_operation_type(self, sql: str) -> str:
+        """Get the primary operation type of SQL"""
+        sql_upper = sql.upper().strip()
+        for op in ['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'MERGE']:
+            if sql_upper.startswith(op):
+                return op
+        return 'OTHER'
     
-    def _infer_relationships(self) -> None:
-        """Infer relationships based on foreign key patterns"""
-        for table_name, table in self.tables.items():
-            # Check foreign keys from ALTER TABLE statements
-            for col_name, (ref_table, ref_col) in table.foreign_keys.items():
-                self._add_relationship(table_name, ref_table, [(col_name, ref_col)], 'foreign_key')
+    def _extract_columns_for_table(self, sql: str, table: str) -> Set[str]:
+        """Extract columns for a specific table"""
+        columns = set()
+        
+        # Pattern for table.column
+        pattern = rf'{table}\.(\w+)'
+        matches = re.findall(pattern, sql, re.IGNORECASE)
+        columns.update(match.upper() for match in matches)
+        
+        return columns
+    
+    def _extract_related_tables(self, sql: str, target_table: str) -> Set[str]:
+        """Extract tables related to target table through JOINs"""
+        related = set()
+        
+        # Look for JOIN patterns involving target table
+        join_pattern = rf'{target_table}\s+\w*\s*JOIN\s+(\w+)|(\w+)\s+\w*\s*JOIN\s+{target_table}'
+        matches = re.findall(join_pattern, sql, re.IGNORECASE)
+        
+        for match_tuple in matches:
+            for match in match_tuple:
+                if match:
+                    related.add(match.upper())
+        
+        return related
+    
+    def _extract_join_columns(self, sql: str, table: str) -> List[str]:
+        """Extract columns used in JOIN conditions for a table"""
+        columns = []
+        
+        # Pattern for join conditions
+        pattern = rf'{table}\.(\w+)\s*=\s*\w+\.\w+|\w+\.\w+\s*=\s*{table}\.(\w+)'
+        matches = re.findall(pattern, sql, re.IGNORECASE)
+        
+        for match_tuple in matches:
+            for match in match_tuple:
+                if match:
+                    columns.append(match.upper())
+        
+        return columns
+    
+    def _calculate_table_importance(self) -> None:
+        """Calculate importance score for each table"""
+        if not self.table_profiles:
+            return
+        
+        # Factors for importance
+        max_usage = max(sum(p.primary_operations.values()) for p in self.table_profiles.values())
+        max_integrity = max(p.integrity_check_frequency + p.integrity_fix_frequency 
+                          for p in self.table_profiles.values())
+        max_relationships = max(len(p.relationship_tables) for p in self.table_profiles.values())
+        
+        for profile in self.table_profiles.values():
+            usage_score = sum(profile.primary_operations.values()) / max(max_usage, 1)
+            integrity_score = (profile.integrity_check_frequency + profile.integrity_fix_frequency) / max(max_integrity, 1)
+            relationship_score = len(profile.relationship_tables) / max(max_relationships, 1)
             
-            # Check column naming patterns
-            for col_name, column in table.columns.items():
-                # Look for foreign key naming patterns
-                if self.column_patterns['foreign_key'].match(col_name):
-                    # Try to find referenced table
-                    potential_table = col_name.replace('_ID', '').replace('_KEY', '').upper()
-                    if potential_table in self.tables:
-                        self._add_relationship(table_name, potential_table, [(col_name, 'ID')], 'naming_convention')
-    
-    def _detect_junction_tables(self) -> None:
-        """Detect junction tables for many-to-many relationships"""
-        for table_name, table in self.tables.items():
-            # Check if table name suggests junction table
-            is_junction = any(indicator in table_name for indicator in self.naming_conventions['junction_table_indicators'])
-            
-            # Check if table has mainly foreign keys
-            if len(table.columns) > 0:
-                fk_ratio = len(table.foreign_keys) / len(table.columns)
-                if fk_ratio > 0.6 or is_junction:
-                    # Likely a junction table
-                    self._process_junction_table(table_name, table)
-    
-    def _process_junction_table(self, table_name: str, table: Table) -> None:
-        """Process a junction table to create many-to-many relationships"""
-        # Find the two main foreign keys
-        fk_tables = list(set(ref_table for ref_table, _ in table.foreign_keys.values()))
-        
-        if len(fk_tables) >= 2:
-            # Create many-to-many relationship between the first two tables
-            self._add_relationship(
-                fk_tables[0], 
-                fk_tables[1], 
-                [(table_name, table_name)],  # Junction table as evidence
-                'many_to_many_junction',
-                relationship_type='many-to-many'
+            # Weighted importance
+            profile.estimated_importance = (
+                0.3 * usage_score + 
+                0.4 * integrity_score + 
+                0.3 * relationship_score
             )
     
-    def _analyze_naming_patterns(self) -> None:
-        """Analyze column naming patterns for additional relationships"""
-        # Group columns by name pattern
-        column_groups = defaultdict(list)
+    def discover_integrity_rules(self) -> List[DynamicIntegrityRule]:
+        """Discover integrity rules from SQL patterns"""
+        logger.info("Discovering integrity rules from patterns...")
         
-        for table_name, table in self.tables.items():
-            for col_name in table.columns:
-                # Extract base name (remove common suffixes)
-                base_name = re.sub(r'(_ID|_KEY|_REF|_FK)$', '', col_name, flags=re.IGNORECASE)
-                column_groups[base_name].append((table_name, col_name))
+        # First, profile tables
+        self.profile_tables()
         
-        # Find relationships from common column names
-        for base_name, occurrences in column_groups.items():
-            if len(occurrences) > 1 and base_name.upper() in self.tables:
-                # Likely foreign key references to the base_name table
-                target_table = base_name.upper()
-                for source_table, col_name in occurrences:
-                    if source_table != target_table:
-                        self._add_relationship(
-                            source_table, 
-                            target_table, 
-                            [(col_name, 'ID')], 
-                            'naming_pattern'
-                        )
+        # Analyze integrity sequences for rule patterns
+        for sequence in self.analyzer.integrity_sequences:
+            rule = self._create_rule_from_sequence(sequence)
+            if rule:
+                self.discovered_rules.append(rule)
+        
+        # Use LLM to understand complex patterns
+        self._enhance_rules_with_llm()
+        
+        # Prioritize rules
+        self._prioritize_rules()
+        
+        logger.info(f"Discovered {len(self.discovered_rules)} integrity rules")
+        return self.discovered_rules
     
-    def _add_relationship(self, source: str, target: str, 
-                         join_columns: List[Tuple[str, str]], 
-                         method: str,
-                         relationship_type: Optional[str] = None) -> None:
-        """Add a discovered relationship"""
-        # Check if relationship already exists
-        for rel in self.relationships:
-            if (rel.source_table == source and rel.target_table == target and 
-                rel.join_columns == join_columns):
-                # Update confidence if found again
-                rel.confidence = min(1.0, rel.confidence + 0.1)
-                return
+    def _create_rule_from_sequence(self, sequence) -> Optional[DynamicIntegrityRule]:
+        """Create an integrity rule from a check-fix sequence"""
+        # Determine rule category
+        rule_category = self._categorize_sequence(sequence)
         
-        # Determine relationship type if not specified
-        if not relationship_type:
-            relationship_type = self._infer_relationship_type(source, target, join_columns)
+        if not rule_category:
+            return None
         
-        # Create new relationship
-        relationship = TableRelationship(
-            source_table=source,
-            target_table=target,
-            join_columns=join_columns,
-            relationship_type=relationship_type,
-            confidence=0.5 if method == 'naming_convention' else 0.8,
-            discovery_method=method
+        # Generate rule ID
+        tables_str = '_'.join(sorted(sequence.tables_involved)[:2])
+        rule_id = f"RULE_{rule_category}_{tables_str}_{sequence.sequence_id[:8]}"
+        
+        # Calculate severity based on table importance
+        severity = self._calculate_severity(sequence.tables_involved)
+        
+        return DynamicIntegrityRule(
+            rule_id=rule_id,
+            rule_name=f"{sequence.issue_type.replace('_', ' ').title()} Rule",
+            description=f"Detects and fixes {sequence.issue_type} in {', '.join(sequence.tables_involved)}",
+            affected_tables=list(sequence.tables_involved),
+            check_pattern=sequence.check_pattern,
+            fix_pattern=sequence.fix_pattern,
+            example_check_sql=sequence.check_sql[:500],  # Truncate for readability
+            example_fix_sql=sequence.fix_sql[:500] if sequence.fix_sql else None,
+            severity=severity,
+            frequency=sequence.occurrence_count,
+            confidence=sequence.confidence,
+            business_impact=self._assess_business_impact(sequence)
         )
-        
-        self.relationships.append(relationship)
-        
-        # Add to table's relationships
-        if source in self.tables:
-            self.tables[source].relationships.append(relationship)
     
-    def _infer_relationship_type(self, source: str, target: str, 
-                                join_columns: List[Tuple[str, str]]) -> str:
-        """Infer the type of relationship"""
-        source_table = self.tables.get(source)
-        target_table = self.tables.get(target)
+    def _categorize_sequence(self, sequence) -> Optional[str]:
+        """Categorize a sequence into known pattern types"""
+        check_sql_upper = sequence.check_sql.upper()
         
-        if not source_table or not target_table:
-            return 'unknown'
+        for category, patterns in self.pattern_library.items():
+            for check_pattern in patterns['check']:
+                if re.search(check_pattern, check_sql_upper):
+                    return category.replace('_patterns', '')
         
-        # Check if join column is primary key in either table
-        source_col = join_columns[0][0]
-        target_col = join_columns[0][1]
-        
-        source_is_pk = source_col in source_table.primary_keys
-        target_is_pk = target_col in target_table.primary_keys
-        
-        if source_is_pk and target_is_pk:
-            return 'one-to-one'
-        elif target_is_pk:
-            return 'many-to-one'
-        elif source_is_pk:
-            return 'one-to-many'
-        else:
-            return 'many-to-many'
+        return 'custom'
     
-    def generate_schema_report(self) -> Dict[str, Any]:
-        """Generate comprehensive schema discovery report"""
-        report = {
-            'summary': {
-                'total_tables': len(self.tables),
-                'total_relationships': len(self.relationships),
-                'tables_by_usage': [],
-                'relationship_types': defaultdict(int),
-                'discovery_methods': defaultdict(int)
-            },
-            'tables': {},
-            'relationships': [],
-            'potential_issues': []
-        }
+    def _calculate_severity(self, tables: Set[str]) -> str:
+        """Calculate severity based on table importance"""
+        if not tables:
+            return 'low'
         
-        # Tables by usage frequency
-        tables_by_usage = sorted(
-            [(name, table.usage_frequency) for name, table in self.tables.items()],
-            key=lambda x: x[1],
-            reverse=True
-        )
-        report['summary']['tables_by_usage'] = tables_by_usage[:20]
-        
-        # Relationship statistics
-        for rel in self.relationships:
-            report['summary']['relationship_types'][rel.relationship_type] += 1
-            report['summary']['discovery_methods'][rel.discovery_method] += 1
-        
-        # Detailed table information
-        for name, table in self.tables.items():
-            report['tables'][name] = {
-                'columns': len(table.columns),
-                'primary_keys': list(table.primary_keys),
-                'foreign_keys': dict(table.foreign_keys),
-                'usage_frequency': table.usage_frequency,
-                'operation_types': dict(table.operation_types),
-                'relationships_count': len(table.relationships)
-            }
-        
-        # Relationships
-        report['relationships'] = [
-            {
-                'source': rel.source_table,
-                'target': rel.target_table,
-                'type': rel.relationship_type,
-                'confidence': rel.confidence,
-                'method': rel.discovery_method,
-                'join_columns': rel.join_columns
-            }
-            for rel in sorted(self.relationships, key=lambda x: x.confidence, reverse=True)
+        # Get average importance of involved tables
+        importances = [
+            self.table_profiles[table].estimated_importance 
+            for table in tables 
+            if table in self.table_profiles
         ]
         
-        # Identify potential issues
-        report['potential_issues'] = self._identify_schema_issues()
+        if not importances:
+            return 'medium'
         
-        return report
+        avg_importance = np.mean(importances)
+        
+        if avg_importance > 0.7:
+            return 'critical'
+        elif avg_importance > 0.5:
+            return 'high'
+        elif avg_importance > 0.3:
+            return 'medium'
+        else:
+            return 'low'
     
-    def _identify_schema_issues(self) -> List[Dict[str, Any]]:
-        """Identify potential schema issues"""
-        issues = []
-        
-        # Tables without primary keys
-        for name, table in self.tables.items():
-            if not table.primary_keys:
-                issues.append({
-                    'type': 'missing_primary_key',
-                    'table': name,
-                    'severity': 'high',
-                    'description': f'Table {name} has no identified primary key'
-                })
-        
-        # Isolated tables (no relationships)
-        for name, table in self.tables.items():
-            if not table.relationships and table.usage_frequency > 10:
-                issues.append({
-                    'type': 'isolated_table',
-                    'table': name,
-                    'severity': 'medium',
-                    'description': f'Table {name} has no relationships but is frequently used'
-                })
-        
-        # Potential missing foreign keys
-        for name, table in self.tables.items():
-            for col_name in table.columns:
-                if (self.column_patterns['foreign_key'].match(col_name) and 
-                    col_name not in table.foreign_keys):
-                    issues.append({
-                        'type': 'potential_missing_fk',
-                        'table': name,
-                        'column': col_name,
-                        'severity': 'low',
-                        'description': f'Column {col_name} looks like a foreign key but has no constraint'
-                    })
-        
-        return issues
-    
-    def visualize_schema(self, output_path: str, max_tables: int = 50) -> None:
-        """Create visual representation of discovered schema"""
-        G = nx.DiGraph()
-        
-        # Select most important tables
-        important_tables = sorted(
-            self.tables.items(),
-            key=lambda x: x[1].usage_frequency,
-            reverse=True
-        )[:max_tables]
-        
-        important_table_names = {name for name, _ in important_tables}
-        
-        # Add nodes
-        for name, table in important_tables:
-            node_size = min(5000, 1000 + table.usage_frequency * 10)
-            G.add_node(name, size=node_size, 
-                      color='lightblue' if table.primary_keys else 'lightcoral')
-        
-        # Add edges for relationships
-        for rel in self.relationships:
-            if (rel.source_table in important_table_names and 
-                rel.target_table in important_table_names):
-                G.add_edge(
-                    rel.source_table, 
-                    rel.target_table,
-                    weight=rel.confidence,
-                    type=rel.relationship_type,
-                    method=rel.discovery_method
-                )
-        
-        # Create visualization
-        plt.figure(figsize=(20, 16))
-        
-        # Use hierarchical layout for better visibility
-        pos = nx.spring_layout(G, k=3, iterations=50, seed=42)
-        
-        # Draw nodes
-        node_colors = [G.nodes[node].get('color', 'lightblue') for node in G.nodes()]
-        node_sizes = [G.nodes[node].get('size', 1000) for node in G.nodes()]
-        
-        nx.draw_networkx_nodes(G, pos, node_color=node_colors, 
-                              node_size=node_sizes, alpha=0.7)
-        
-        # Draw edges with different styles for different relationship types
-        edge_styles = {
-            'one-to-one': 'solid',
-            'one-to-many': 'dashed',
-            'many-to-many': 'dotted',
-            'unknown': 'dashdot'
+    def _assess_business_impact(self, sequence) -> str:
+        """Assess the business impact of an integrity issue"""
+        # Simple heuristic based on issue type and tables
+        impact_keywords = {
+            'critical': ['CUSTOMER', 'ORDER', 'PAYMENT', 'ACCOUNT', 'SIGNAL'],
+            'high': ['FIBER', 'SPLICE', 'EQUIPMENT', 'PORT', 'CABLE'],
+            'medium': ['SEGMENT', 'SPAN', 'ROUTE', 'PATH'],
+            'low': ['LOG', 'TEMP', 'BACKUP', 'ARCHIVE']
         }
         
-        for rel_type, style in edge_styles.items():
-            edges = [(u, v) for u, v, d in G.edges(data=True) 
-                    if d.get('type') == rel_type]
-            if edges:
-                nx.draw_networkx_edges(G, pos, edges, style=style, 
-                                     alpha=0.5, arrows=True, arrowsize=20)
+        tables_upper = [t.upper() for t in sequence.tables_involved]
         
-        # Draw labels
-        nx.draw_networkx_labels(G, pos, font_size=8, font_weight='bold')
+        for impact_level, keywords in impact_keywords.items():
+            if any(keyword in table for keyword in keywords for table in tables_upper):
+                return f"{impact_level.title()} - Affects {sequence.issue_type.replace('_', ' ')}"
         
-        # Add legend
-        plt.legend(
-            handles=[
-                plt.Line2D([0], [0], color='black', linestyle='solid', label='one-to-one'),
-                plt.Line2D([0], [0], color='black', linestyle='dashed', label='one-to-many'),
-                plt.Line2D([0], [0], color='black', linestyle='dotted', label='many-to-many'),
-                plt.scatter([0], [0], color='lightblue', s=100, label='Has Primary Key'),
-                plt.scatter([0], [0], color='lightcoral', s=100, label='No Primary Key')
-            ],
-            loc='upper right'
-        )
+        return "Medium - General data quality impact"
+    
+    def _enhance_rules_with_llm(self) -> None:
+        """Use LLM to enhance understanding of complex rules"""
+        logger.info("Enhancing rules with LLM analysis...")
         
-        plt.title('Dynamically Discovered Database Schema', fontsize=16)
-        plt.axis('off')
-        plt.tight_layout()
-        plt.savefig(output_path, dpi=300, bbox_inches='tight')
-        plt.close()
+        # Group rules by pattern for batch analysis
+        pattern_groups = defaultdict(list)
+        for rule in self.discovered_rules:
+            pattern_groups[rule.check_pattern].append(rule)
+        
+        # Analyze top patterns with LLM
+        for pattern, rules in sorted(pattern_groups.items(), 
+                                   key=lambda x: sum(r.frequency for r in x[1]), 
+                                   reverse=True)[:10]:
+            
+            sample_rules = rules[:3]
+            prompt = f"""Analyze these data integrity rules from a Fiber Management System:
 
-class AdaptiveIntegrityAnalyzer:
-    """Analyzes integrity based on discovered schema"""
-    
-    def __init__(self, schema_engine: SchemaDiscoveryEngine):
-        self.schema = schema_engine
-        self.integrity_rules = []
-        self.llm_insights = {}
-    
-    def generate_integrity_rules(self) -> List[Dict[str, Any]]:
-        """Generate integrity rules based on discovered schema"""
-        rules = []
-        
-        # Rule 1: Foreign Key Integrity
-        for table_name, table in self.schema.tables.items():
-            for col_name, (ref_table, ref_col) in table.foreign_keys.items():
-                rules.append({
-                    'rule_id': f'FK_{table_name}_{col_name}',
-                    'type': 'foreign_key_integrity',
-                    'description': f'{table_name}.{col_name} must reference valid {ref_table}.{ref_col}',
-                    'check_sql': f"""
-                        SELECT t1.* FROM {table_name} t1 
-                        LEFT JOIN {ref_table} t2 ON t1.{col_name} = t2.{ref_col}
-                        WHERE t2.{ref_col} IS NULL AND t1.{col_name} IS NOT NULL
-                    """,
-                    'fix_sql': f"""
-                        DELETE FROM {table_name} 
-                        WHERE {col_name} NOT IN (SELECT {ref_col} FROM {ref_table})
-                        AND {col_name} IS NOT NULL
-                    """,
-                    'severity': 'high'
-                })
-        
-        # Rule 2: Orphaned Records in Related Tables
-        for rel in self.schema.relationships:
-            if rel.relationship_type in ['one-to-many', 'many-to-one']:
-                rules.append({
-                    'rule_id': f'ORPHAN_{rel.source_table}_{rel.target_table}',
-                    'type': 'orphaned_records',
-                    'description': f'Check for orphaned records between {rel.source_table} and {rel.target_table}',
-                    'check_sql': f"""
-                        SELECT * FROM {rel.source_table} s
-                        WHERE NOT EXISTS (
-                            SELECT 1 FROM {rel.target_table} t
-                            WHERE s.{rel.join_columns[0][0]} = t.{rel.join_columns[0][1]}
-                        )
-                    """,
-                    'severity': 'medium'
-                })
-        
-        # Rule 3: Duplicate Detection Based on Natural Keys
-        for table_name, table in self.schema.tables.items():
-            # Find potential natural key combinations
-            non_pk_columns = [col for col in table.columns if col not in table.primary_keys]
-            if non_pk_columns and len(non_pk_columns) <= 3:
-                cols_str = ', '.join(non_pk_columns[:3])
-                rules.append({
-                    'rule_id': f'DUP_{table_name}',
-                    'type': 'duplicate_detection',
-                    'description': f'Check for duplicates in {table_name} based on {cols_str}',
-                    'check_sql': f"""
-                        SELECT {cols_str}, COUNT(*) as cnt
-                        FROM {table_name}
-                        GROUP BY {cols_str}
-                        HAVING COUNT(*) > 1
-                    """,
-                    'severity': 'medium'
-                })
-        
-        # Rule 4: Cyclic Dependencies
-        for table_name, table in self.schema.tables.items():
-            if len(table.foreign_keys) > 1:
-                rules.append({
-                    'rule_id': f'CYCLE_{table_name}',
-                    'type': 'cyclic_dependency',
-                    'description': f'Check for cyclic dependencies in {table_name}',
-                    'check_sql': f"""
-                        -- Complex recursive CTE to detect cycles
-                        -- Specific implementation depends on the relationships
-                    """,
-                    'severity': 'high'
-                })
-        
-        # Rule 5: Data Type Consistency
-        column_types = defaultdict(lambda: defaultdict(set))
-        for table_name, table in self.schema.tables.items():
-            for col_name, column in table.columns.items():
-                base_name = re.sub(r'(_ID|_KEY|_REF|_FK)$', '', col_name, flags=re.IGNORECASE)
-                column_types[base_name][table_name].add(col_name)
-        
-        for base_name, table_cols in column_types.items():
-            if len(table_cols) > 1:
-                rules.append({
-                    'rule_id': f'CONSISTENCY_{base_name}',
-                    'type': 'data_type_consistency',
-                    'description': f'Ensure consistent data types for {base_name} across tables',
-                    'tables': list(table_cols.keys()),
-                    'severity': 'low'
-                })
-        
-        return rules
-    
-    def analyze_with_llm(self, sql_patterns: List[str], llm_endpoint: str) -> Dict[str, Any]:
-        """Use LLM to understand complex integrity patterns"""
-        # Group similar SQL patterns
-        pattern_groups = self._group_similar_patterns(sql_patterns)
-        
-        insights = {}
-        for group_name, patterns in pattern_groups.items():
-            prompt = f"""
-            Analyze these SQL patterns from a database with the following key tables:
-            {', '.join(list(self.schema.tables.keys())[:20])}
-            
-            SQL Pattern Group: {group_name}
-            Sample SQLs:
-            {chr(10).join(patterns[:5])}
-            
-            Please identify:
-            1. What integrity issue these queries are addressing
-            2. The business rule being enforced
-            3. Potential risks or improvements
-            4. Related tables and their relationships
-            
-            Return as JSON with keys: issue_type, business_rule, risks, improvements, affected_tables
-            """
+Pattern Type: {pattern}
+Affected Tables: {', '.join(set(t for r in sample_rules for t in r.affected_tables))}
+
+Example Check SQL:
+{sample_rules[0].example_check_sql}
+
+Example Fix SQL:
+{sample_rules[0].example_fix_sql if sample_rules[0].example_fix_sql else 'No fix SQL available'}
+
+Based on this pattern:
+1. What specific integrity issue is being addressed?
+2. What could cause this issue in a fiber management context?
+3. What are the business implications if not fixed?
+4. Suggest preventive measures
+
+Respond in JSON format with keys: issue_description, root_causes, business_impact, prevention_measures
+"""
             
             try:
-                response = requests.post(
-                    llm_endpoint,
-                    json={'prompt': prompt, 'max_tokens': 500},
-                    timeout=30
-                )
-                insights[group_name] = response.json()
+                response = answer_from_ollama(prompt, self.llm_model)
+                insights = json.loads(response)
+                
+                # Update rules with insights
+                for rule in rules:
+                    if 'issue_description' in insights:
+                        rule.description = insights['issue_description']
+                    if 'business_impact' in insights:
+                        rule.business_impact = insights['business_impact']
+                        
             except Exception as e:
-                logger.error(f"LLM analysis failed: {e}")
-                insights[group_name] = None
-        
-        return insights
+                logger.debug(f"LLM enhancement failed for pattern {pattern}: {e}")
     
-    def _group_similar_patterns(self, sql_patterns: List[str]) -> Dict[str, List[str]]:
-        """Group similar SQL patterns using pattern matching"""
-        groups = defaultdict(list)
-        
-        for sql in sql_patterns:
-            # Normalize SQL for grouping
-            normalized = re.sub(r'\b\d+\b', 'N', sql)  # Replace numbers with N
-            normalized = re.sub(r"'[^']*'", "'STR'", normalized)  # Replace strings
+    def _prioritize_rules(self) -> None:
+        """Prioritize rules based on multiple factors"""
+        # Sort rules by composite score
+        for rule in self.discovered_rules:
+            severity_score = {'critical': 4, 'high': 3, 'medium': 2, 'low': 1}[rule.severity]
+            frequency_score = min(rule.frequency / 10, 5)  # Normalize to 0-5
+            confidence_score = rule.confidence * 5
             
-            # Simple grouping by operation and main table
-            operation = sql.split()[0].upper()
-            tables = self._extract_main_table(sql)
-            
-            group_key = f"{operation}_{tables}"
-            groups[group_key].append(sql)
+            rule.priority_score = severity_score + frequency_score + confidence_score
         
-        return dict(groups)
+        self.discovered_rules.sort(key=lambda r: r.priority_score, reverse=True)
     
-    def _extract_main_table(self, sql: str) -> str:
-        """Extract the main table from SQL"""
-        patterns = [
-            (r'FROM\s+(\w+)', 'FROM'),
-            (r'UPDATE\s+(\w+)', 'UPDATE'),
-            (r'INSERT\s+INTO\s+(\w+)', 'INSERT'),
-            (r'DELETE\s+FROM\s+(\w+)', 'DELETE')
-        ]
+    def generate_remediation_plan(self) -> Dict[str, Any]:
+        """Generate a prioritized remediation plan"""
+        plan = {
+            'summary': {
+                'total_rules': len(self.discovered_rules),
+                'critical_issues': sum(1 for r in self.discovered_rules if r.severity == 'critical'),
+                'estimated_effort_days': self._estimate_remediation_effort()
+            },
+            'phases': [],
+            'quick_wins': [],
+            'preventive_measures': []
+        }
         
-        for pattern, _ in patterns:
-            match = re.search(pattern, sql, re.IGNORECASE)
-            if match:
-                return match.group(1).upper()
+        # Phase 1: Critical issues
+        critical_rules = [r for r in self.discovered_rules if r.severity == 'critical']
+        if critical_rules:
+            plan['phases'].append({
+                'phase': 1,
+                'name': 'Critical Issue Remediation',
+                'duration_days': len(critical_rules) * 2,
+                'rules': [self._rule_to_dict(r) for r in critical_rules[:10]]
+            })
         
-        return 'UNKNOWN'
+        # Phase 2: High frequency issues
+        high_freq_rules = [r for r in self.discovered_rules 
+                          if r.severity in ['high', 'medium'] and r.frequency > 10]
+        if high_freq_rules:
+            plan['phases'].append({
+                'phase': 2,
+                'name': 'High Frequency Issue Resolution',
+                'duration_days': len(high_freq_rules) * 1.5,
+                'rules': [self._rule_to_dict(r) for r in high_freq_rules[:15]]
+            })
+        
+        # Quick wins - high confidence, low effort fixes
+        quick_wins = [r for r in self.discovered_rules 
+                     if r.confidence > 0.8 and r.fix_pattern and r.severity in ['medium', 'low']]
+        plan['quick_wins'] = [self._rule_to_dict(r) for r in quick_wins[:10]]
+        
+        # Generate preventive measures using LLM
+        plan['preventive_measures'] = self._generate_preventive_measures()
+        
+        return plan
+    
+    def _estimate_remediation_effort(self) -> int:
+        """Estimate total remediation effort in days"""
+        effort_map = {
+            'critical': 2,
+            'high': 1.5,
+            'medium': 1,
+            'low': 0.5
+        }
+        
+        total_days = sum(effort_map.get(rule.severity, 1) for rule in self.discovered_rules)
+        return int(total_days)
+    
+    def _rule_to_dict(self, rule: DynamicIntegrityRule) -> Dict[str, Any]:
+        """Convert rule to dictionary for reporting"""
+        return {
+            'rule_id': rule.rule_id,
+            'name': rule.rule_name,
+            'description': rule.description,
+            'severity': rule.severity,
+            'tables': rule.affected_tables,
+            'frequency': rule.frequency,
+            'has_automated_fix': bool(rule.fix_pattern),
+            'business_impact': rule.business_impact
+        }
+    
+    def _generate_preventive_measures(self) -> List[str]:
+        """Generate preventive measures based on discovered patterns"""
+        # Analyze common issue types
+        issue_types = Counter(r.check_pattern for r in self.discovered_rules)
+        top_issues = issue_types.most_common(5)
+        
+        prompt = f"""Based on these common data integrity issues in a Fiber Management System:
 
-# Main execution function
-def analyze_database_integrity(sql_file_path: str,
-                             llm_endpoints: Dict[str, str],
-                             output_dir: str = './integrity_analysis') -> Dict[str, Any]:
-    """Complete database integrity analysis with dynamic schema discovery"""
+{chr(10).join(f"- {issue}: {count} occurrences" for issue, count in top_issues)}
+
+Suggest 5 preventive measures that could be implemented to avoid these issues in the future.
+Focus on:
+1. Database constraints
+2. Application validation
+3. Process improvements
+4. Monitoring recommendations
+
+Provide practical, implementable suggestions.
+Return as a JSON array of strings.
+"""
+        
+        try:
+            response = answer_from_ollama(prompt, self.llm_model)
+            measures = json.loads(response)
+            return measures if isinstance(measures, list) else []
+        except:
+            # Fallback to generic measures
+            return [
+                "Implement foreign key constraints on all reference columns",
+                "Add unique constraints on business key combinations",
+                "Create database triggers to validate data on insert/update",
+                "Implement regular integrity check jobs with alerting",
+                "Add application-level validation before database operations"
+            ]
+
+class IntegrityMonitor:
+    """Monitors and tracks integrity issues over time"""
     
-    import os
-    os.makedirs(output_dir, exist_ok=True)
+    def __init__(self, rule_generator: AdaptiveRuleGenerator):
+        self.rule_generator = rule_generator
+        self.monitoring_data = defaultdict(list)
     
-    logger.info("Starting comprehensive database analysis...")
+    def generate_monitoring_dashboard(self, output_dir: str) -> Dict[str, Any]:
+        """Generate monitoring dashboard data"""
+        dashboard = {
+            'timestamp': str(datetime.now()),
+            'overview': self._generate_overview(),
+            'trending_issues': self._analyze_trends(),
+            'table_health_scores': self._calculate_table_health(),
+            'recommendations': self._generate_recommendations()
+        }
+        
+        # Save dashboard data
+        import os
+        os.makedirs(output_dir, exist_ok=True)
+        
+        with open(os.path.join(output_dir, 'monitoring_dashboard.json'), 'w') as f:
+            json.dump(dashboard, f, indent=2)
+        
+        return dashboard
     
-    # Step 1: Read SQL file
-    with open(sql_file_path, 'r', encoding='utf-8', errors='ignore') as f:
-        content = f.read()
+    def _generate_overview(self) -> Dict[str, Any]:
+        """Generate overview statistics"""
+        rules = self.rule_generator.discovered_rules
+        
+        return {
+            'total_integrity_rules': len(rules),
+            'severity_distribution': dict(Counter(r.severity for r in rules)),
+            'tables_with_issues': len(set(t for r in rules for t in r.affected_tables)),
+            'automated_fix_available': sum(1 for r in rules if r.fix_pattern),
+            'total_issue_occurrences': sum(r.frequency for r in rules)
+        }
     
-    # Split into individual statements
-    sql_statements = [s.strip() for s in sqlparse.split(content) if s.strip()]
-    logger.info(f"Found {len(sql_statements)} SQL statements")
+    def _analyze_trends(self) -> List[Dict[str, Any]]:
+        """Analyze trending integrity issues"""
+        # Group by time periods in the original data
+        df = self.rule_generator.analyzer.df
+        integrity_df = df[df['purpose'].isin(['integrity_check', 'integrity_fix'])]
+        
+        if integrity_df.empty:
+            return []
+        
+        # Weekly trends
+        integrity_df['week'] = integrity_df['LAST_LOAD_TIME'].dt.to_period('W')
+        weekly_counts = integrity_df.groupby(['week', 'sub_type']).size()
+        
+        trends = []
+        for (week, sub_type), count in weekly_counts.items():
+            trends.append({
+                'period': str(week),
+                'issue_type': sub_type,
+                'count': int(count),
+                'trend': 'increasing' if count > weekly_counts.mean() else 'stable'
+            })
+        
+        return sorted(trends, key=lambda x: x['count'], reverse=True)[:10]
     
-    # Step 2: Discover schema dynamically
-    schema_engine = SchemaDiscoveryEngine()
-    discovered_tables = schema_engine.discover_schema(sql_statements)
+    def _calculate_table_health(self) -> Dict[str, float]:
+        """Calculate health scores for tables"""
+        health_scores = {}
+        
+        for table_name, profile in self.rule_generator.table_profiles.items():
+            # Health factors (0-1, higher is healthier)
+            integrity_ratio = 1 - min(
+                (profile.integrity_check_frequency + profile.integrity_fix_frequency) / 
+                max(sum(profile.primary_operations.values()), 1), 
+                1
+            )
+            
+            # Tables with fewer integrity issues are healthier
+            issues_count = sum(1 for r in self.rule_generator.discovered_rules 
+                             if table_name in r.affected_tables)
+            issue_score = 1 - min(issues_count / 10, 1)
+            
+            # Combined health score
+            health_scores[table_name] = round((integrity_ratio + issue_score) / 2, 2)
+        
+        # Return top 20 tables by importance
+        important_tables = sorted(
+            health_scores.items(),
+            key=lambda x: self.rule_generator.table_profiles[x[0]].estimated_importance,
+            reverse=True
+        )[:20]
+        
+        return dict(important_tables)
     
-    # Generate schema report
-    schema_report = schema_engine.generate_schema_report()
+    def _generate_recommendations(self) -> List[Dict[str, str]]:
+        """Generate actionable recommendations"""
+        recommendations = []
+        
+        # Analyze patterns for recommendations
+        rules = self.rule_generator.discovered_rules
+        
+        # Tables with most critical issues
+        critical_tables = defaultdict(int)
+        for rule in rules:
+            if rule.severity == 'critical':
+                for table in rule.affected_tables:
+                    critical_tables[table] += 1
+        
+        if critical_tables:
+            top_critical = sorted(critical_tables.items(), key=lambda x: x[1], reverse=True)[0]
+            recommendations.append({
+                'priority': 'high',
+                'category': 'critical_tables',
+                'recommendation': f"Focus immediate attention on {top_critical[0]} table with {top_critical[1]} critical issues",
+                'action': f"Review and execute all critical fixes for {top_critical[0]} table"
+            })
+        
+        # Patterns without automated fixes
+        manual_fixes = [r for r in rules if not r.fix_pattern and r.frequency > 5]
+        if manual_fixes:
+            recommendations.append({
+                'priority': 'medium',
+                'category': 'automation',
+                'recommendation': f"Develop automated fixes for {len(manual_fixes)} recurring manual patterns",
+                'action': "Create SQL templates or procedures for common manual fixes"
+            })
+        
+        # High frequency low severity issues (quick wins)
+        quick_wins = [r for r in rules if r.severity == 'low' and r.frequency > 10]
+        if quick_wins:
+            recommendations.append({
+                'priority': 'low',
+                'category': 'quick_wins',
+                'recommendation': f"Address {len(quick_wins)} high-frequency minor issues for quick improvements",
+                'action': "Schedule batch execution of low-risk automated fixes"
+            })
+        
+        return recommendations
+
+# Integrated execution function
+def analyze_fiber_integrity_complete(csv_path: str,
+                                   llm_model: str = "qwen3:30b",
+                                   output_dir: str = './integrity_analysis') -> Dict[str, Any]:
+    """Complete integrity analysis with adaptive rule generation"""
     
-    # Save schema report
-    with open(os.path.join(output_dir, 'discovered_schema.json'), 'w') as f:
-        json.dump(schema_report, f, indent=2)
+    # Import the main analyzer
+    from vsql_integrity_analyzer import analyze_vsql_integrity, VSQLAnalyzer
     
-    # Visualize schema
-    schema_engine.visualize_schema(
-        os.path.join(output_dir, 'discovered_schema_visualization.png')
-    )
+    # Run initial analysis
+    initial_results = analyze_vsql_integrity(csv_path, llm_model, output_dir)
     
-    # Step 3: Generate integrity rules based on discovered schema
-    integrity_analyzer = AdaptiveIntegrityAnalyzer(schema_engine)
-    integrity_rules = integrity_analyzer.generate_integrity_rules()
+    # Load analyzer for advanced analysis
+    analyzer = VSQLAnalyzer(csv_path, llm_model)
+    analyzer.load_vsql_file()
+    analyzer.discover_integrity_sequences()
     
-    # Save integrity rules
-    with open(os.path.join(output_dir, 'generated_integrity_rules.json'), 'w') as f:
-        json.dump(integrity_rules, f, indent=2)
+    # Generate adaptive rules
+    rule_generator = AdaptiveRuleGenerator(analyzer, llm_model)
+    discovered_rules = rule_generator.discover_integrity_rules()
     
-    # Step 4: Analyze patterns with LLM
-    logger.info("Analyzing SQL patterns with LLM...")
-    sample_sqls = sql_statements[:1000]  # Sample for LLM analysis
-    llm_insights = integrity_analyzer.analyze_with_llm(
-        sample_sqls, 
-        llm_endpoints.get('qwen', 'http://localhost:8080/v1/completions')
-    )
+    # Generate remediation plan
+    remediation_plan = rule_generator.generate_remediation_plan()
     
-    # Step 5: Generate comprehensive report
-    final_report = {
-        'summary': {
-            'total_tables_discovered': len(discovered_tables),
-            'total_relationships': len(schema_engine.relationships),
-            'total_integrity_rules': len(integrity_rules),
-            'timestamp': str(datetime.now())
-        },
-        'top_tables': schema_report['summary']['tables_by_usage'][:10],
-        'relationship_summary': dict(schema_report['summary']['relationship_types']),
-        'potential_issues': schema_report['potential_issues'][:20],
-        'integrity_rules_summary': {
-            'by_type': defaultdict(int),
-            'by_severity': defaultdict(int)
-        },
-        'llm_insights': llm_insights
+    # Create monitoring dashboard
+    monitor = IntegrityMonitor(rule_generator)
+    dashboard = monitor.generate_monitoring_dashboard(output_dir)
+    
+    # Save comprehensive results
+    comprehensive_results = {
+        'analysis_summary': initial_results['summary'],
+        'discovered_rules': [
+            {
+                'rule_id': r.rule_id,
+                'name': r.rule_name,
+                'description': r.description,
+                'severity': r.severity,
+                'frequency': r.frequency,
+                'tables': r.affected_tables,
+                'automated_fix': bool(r.fix_pattern)
+            }
+            for r in discovered_rules[:50]  # Top 50 rules
+        ],
+        'remediation_plan': remediation_plan,
+        'monitoring_dashboard': dashboard,
+        'table_profiles': {
+            name: {
+                'importance': profile.estimated_importance,
+                'integrity_issues': profile.integrity_check_frequency + profile.integrity_fix_frequency,
+                'relationships': len(profile.relationship_tables)
+            }
+            for name, profile in sorted(
+                rule_generator.table_profiles.items(),
+                key=lambda x: x[1].estimated_importance,
+                reverse=True
+            )[:20]  # Top 20 tables
+        }
     }
     
-    # Summarize integrity rules
-    for rule in integrity_rules:
-        final_report['integrity_rules_summary']['by_type'][rule['type']] += 1
-        final_report['integrity_rules_summary']['by_severity'][rule.get('severity', 'unknown')] += 1
+    # Save final comprehensive report
+    import os
+    with open(os.path.join(output_dir, 'comprehensive_integrity_report.json'), 'w') as f:
+        json.dump(comprehensive_results, f, indent=2)
     
-    # Convert defaultdicts to regular dicts for JSON serialization
-    final_report['integrity_rules_summary']['by_type'] = dict(final_report['integrity_rules_summary']['by_type'])
-    final_report['integrity_rules_summary']['by_severity'] = dict(final_report['integrity_rules_summary']['by_severity'])
-    
-    # Save final report
-    with open(os.path.join(output_dir, 'integrity_analysis_report.json'), 'w') as f:
-        json.dump(final_report, f, indent=2)
-    
-    # Generate markdown report
-    markdown_report = generate_markdown_report(final_report, schema_report, integrity_rules)
-    with open(os.path.join(output_dir, 'integrity_analysis_report.md'), 'w') as f:
-        f.write(markdown_report)
-    
-    logger.info(f"Analysis complete! Results saved to {output_dir}")
-    
-    return final_report
+    # Generate executive summary
+    exec_summary = f"""
+=== Fiber Database Integrity Analysis Executive Summary ===
 
-def generate_markdown_report(final_report: Dict, schema_report: Dict, integrity_rules: List[Dict]) -> str:
-    """Generate a human-readable markdown report"""
-    report = f"""# Database Integrity Analysis Report
-Generated: {final_report['summary']['timestamp']}
+Analysis Date: {datetime.now().strftime('%Y-%m-%d %H:%M')}
+Total SQL Statements Analyzed: {len(analyzer.df):,}
 
-## Executive Summary
-- **Tables Discovered**: {final_report['summary']['total_tables_discovered']}
-- **Relationships Found**: {final_report['summary']['total_relationships']}
-- **Integrity Rules Generated**: {final_report['summary']['total_integrity_rules']}
+Key Findings:
+- Discovered {len(discovered_rules)} integrity patterns
+- {remediation_plan['summary']['critical_issues']} critical issues requiring immediate attention
+- {len([r for r in discovered_rules if r.fix_pattern])} issues have automated fixes available
+- Estimated {remediation_plan['summary']['estimated_effort_days']} days for complete remediation
 
-## Top 10 Most Used Tables
-| Table Name | Usage Count |
-|------------|-------------|
+Top 3 Critical Issues:
 """
     
-    for table, count in final_report['top_tables']:
-        report += f"| {table} | {count} |\n"
+    for rule in discovered_rules[:3]:
+        if rule.severity == 'critical':
+            exec_summary += f"\n- {rule.rule_name}: {rule.description}"
+            exec_summary += f"\n  Affects: {', '.join(rule.affected_tables)}"
+            exec_summary += f"\n  Frequency: {rule.frequency} occurrences\n"
     
-    report += "\n## Discovered Relationships\n"
-    for rel_type, count in final_report['relationship_summary'].items():
-        report += f"- **{rel_type}**: {count} relationships\n"
+    exec_summary += f"\nFull report available at: {output_dir}"
     
-    report += "\n## Potential Schema Issues\n"
-    for issue in final_report['potential_issues'][:10]:
-        report += f"- **{issue['type']}** ({issue['severity']}): {issue['description']}\n"
+    print(exec_summary)
     
-    report += "\n## Generated Integrity Rules\n"
-    report += "### By Type\n"
-    for rule_type, count in final_report['integrity_rules_summary']['by_type'].items():
-        report += f"- **{rule_type}**: {count} rules\n"
-    
-    report += "\n### Sample Rules\n"
-    for rule in integrity_rules[:5]:
-        report += f"""
-#### {rule['rule_id']}
-- **Type**: {rule['type']}
-- **Severity**: {rule.get('severity', 'unknown')}
-- **Description**: {rule['description']}
-"""
-    
-    return report
+    return comprehensive_results
 
 # Example usage
 if __name__ == "__main__":
-    llm_endpoints = {
-        'qwen': 'http://your-server:port/qwen3-30b/v1/completions',
-        'gpt': 'http://your-server:port/gpt-oss/v1/completions'
-    }
-    
-    results = analyze_database_integrity(
-        sql_file_path='path/to/your/vsql_file.sql',
-        llm_endpoints=llm_endpoints,
-        output_dir='./dynamic_integrity_analysis'
+    results = analyze_fiber_integrity_complete(
+        csv_path='path/to/your/vsql_export.csv',
+        llm_model='qwen3:30b',
+        output_dir='./fiber_integrity_complete'
     )
-    
-    print("Analysis complete!")
-    print(f"Discovered {results['summary']['total_tables_discovered']} tables")
-    print(f"Found {results['summary']['total_relationships']} relationships")
-    print(f"Generated {results['summary']['total_integrity_rules']} integrity rules")
