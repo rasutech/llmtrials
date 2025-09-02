@@ -20,7 +20,7 @@ import os
 import pickle
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Any
+from typing import Dict, List, Optional, Set, Any, Tuple
 from dataclasses import dataclass, field
 from collections import defaultdict, Counter
 
@@ -44,6 +44,8 @@ class AnalysisConfig:
     skip_duplicates: bool = True
     enable_caching: bool = True
     analysis_types: List[str] = field(default_factory=lambda: ["pattern", "relationship", "join"])
+    force_llm_analysis: bool = False  # Force LLM for all SQL statements
+    llm_threshold: float = 0.7  # Confidence threshold for LLM fallback
 
 class SQLDeduplicator:
     """Handles SQL deduplication to avoid reprocessing identical queries"""
@@ -191,6 +193,22 @@ class BatchProcessor:
             'analysis_results': []
         }
         
+        # Initialize analyzers once for the batch
+        pattern_matcher = None
+        rel_engine = None
+        join_engine = None
+        
+        if 'pattern' in self.config.analysis_types:
+            from ultra_optimized_analyzer import OptimizedPatternMatcher
+            pattern_matcher = OptimizedPatternMatcher()
+        
+        if 'relationship' in self.config.analysis_types and not test_mode:
+            from relationship_discovery_analyzer import RelationshipDiscoveryEngine
+            rel_engine = RelationshipDiscoveryEngine()
+        
+        if 'join' in self.config.analysis_types and not test_mode:
+            join_engine = JoinFieldDiscoveryEngine()
+        
         # Process each record
         for idx, row in df.iterrows():
             sql = row['SQL_FULLTEXT']
@@ -204,32 +222,56 @@ class BatchProcessor:
             # Process based on analysis types
             record_result = {
                 'sql_id': sql_id,
+                'sql_fulltext': sql,  # Keep SQL for LLM analysis
                 'analysis': {}
             }
             
-            if 'pattern' in self.config.analysis_types:
-                # Use pattern-based analysis (fast)
-                from ultra_optimized_analyzer import OptimizedPatternMatcher
-                matcher = OptimizedPatternMatcher()
-                purpose, sub_type, confidence = matcher.classify_sql(sql)
+            # Pattern analysis with LLM fallback
+            if pattern_matcher:
+                if self.config.force_llm_analysis:
+                    # Skip pattern matching, go directly to LLM
+                    logging.info(f"Force LLM analysis for SQL {sql_id}")
+                    purpose, sub_type, confidence = self._classify_with_llm(sql, sql_id)
+                    batch_stats['llm_calls'] += 1
+                else:
+                    # Use pattern matcher first
+                    purpose, sub_type, confidence = pattern_matcher.classify_sql(sql)
+                    
+                    # LLM fallback for unknown patterns or low confidence
+                    if purpose == 'unknown' or confidence < self.config.llm_threshold:
+                        logging.info(f"LLM fallback for SQL {sql_id} - pattern: {purpose}, confidence: {confidence}")
+                        purpose, sub_type, confidence = self._classify_with_llm(sql, sql_id)
+                        batch_stats['llm_calls'] += 1
+                
                 record_result['analysis']['pattern'] = {
                     'purpose': purpose,
                     'sub_type': sub_type,
                     'confidence': confidence
                 }
             
-            if 'relationship' in self.config.analysis_types and not test_mode:
-                # Use relationship analysis
-                from relationship_discovery_analyzer import RelationshipDiscoveryEngine
-                rel_engine = RelationshipDiscoveryEngine()
+            # Relationship analysis with LLM
+            if rel_engine and not test_mode:
                 rel_analysis = rel_engine.analyze_sql(sql, sql_id)
                 record_result['analysis']['relationships'] = rel_analysis
+                
+                # Add LLM analysis for complex relationships
+                if len(rel_analysis.get('relationships', [])) > 2:
+                    logging.info(f"Using LLM for complex relationship analysis - SQL {sql_id}")
+                    llm_rel_analysis = self._analyze_relationships_with_llm(sql, rel_analysis)
+                    record_result['analysis']['llm_relationships'] = llm_rel_analysis
+                    batch_stats['llm_calls'] += 1
             
-            if 'join' in self.config.analysis_types and not test_mode:
-                # Use join field analysis
-                join_engine = JoinFieldDiscoveryEngine()
+            # Join analysis with LLM
+            if join_engine and not test_mode:
                 join_analysis = join_engine.analyze_sql_for_joins(sql, sql_id)
                 record_result['analysis']['joins'] = join_analysis
+                
+                # Add LLM analysis for complex joins
+                if len(join_analysis.get('join_patterns', [])) > 1:
+                    logging.info(f"Using LLM for complex join analysis - SQL {sql_id}")
+                    llm_join_analysis = self._analyze_joins_with_llm(sql, join_analysis)
+                    record_result['analysis']['llm_joins'] = llm_join_analysis
+                    batch_stats['llm_calls'] += 1
             
             # Mark as processed
             if self.deduplicator:
@@ -237,17 +279,110 @@ class BatchProcessor:
             
             batch_stats['records_processed'] += 1
             batch_stats['analysis_results'].append(record_result)
-            
-            # Count LLM calls (estimated)
-            if len(sql) > 200 and 'pattern' in record_result['analysis']:
-                if record_result['analysis']['pattern']['purpose'] == 'unknown':
-                    batch_stats['llm_calls'] += 1
         
         # Save deduplicator cache
         if self.deduplicator:
             self.deduplicator.save_cache()
         
         return batch_stats
+    
+    def _classify_with_llm(self, sql: str, sql_id: str) -> Tuple[str, str, float]:
+        """LLM classification for unknown SQL patterns"""
+        try:
+            # Truncate SQL for LLM
+            sql_truncated = sql[:800] if len(sql) > 800 else sql
+            
+            prompt = f"""Analyze this SQL statement and classify its purpose:
+
+SQL ID: {sql_id}
+SQL: {sql_truncated}
+
+Classify as one of:
+1. integrity_check - SQL that checks for data integrity issues (orphaned records, duplicates, missing references, etc.)
+2. integrity_fix - SQL that fixes data integrity issues (DELETE orphans, UPDATE missing values, etc.)
+3. normal_usage - Regular application queries (SELECT for display, simple CRUD operations)
+
+Also identify the specific sub-type and confidence level.
+
+Respond in JSON format:
+{{"purpose": "integrity_check|integrity_fix|normal_usage", "sub_type": "specific description", "confidence": 0.85}}"""
+
+            response = answer_from_ollama(prompt, self.config.llm_model)
+            result = json.loads(response)
+            
+            return (
+                result.get('purpose', 'unknown'),
+                result.get('sub_type', ''),
+                float(result.get('confidence', 0.5))
+            )
+        except Exception as e:
+            logging.error(f"LLM classification failed for {sql_id}: {e}")
+            return ('unknown', 'llm_error', 0.0)
+    
+    def _analyze_relationships_with_llm(self, sql: str, rel_analysis: Dict) -> Dict[str, Any]:
+        """LLM analysis for complex table relationships"""
+        try:
+            tables = list(rel_analysis.get('tables', []))
+            relationships = rel_analysis.get('relationships', [])
+            
+            if not tables:
+                return {}
+            
+            prompt = f"""Analyze the table relationships in this SQL:
+
+Tables involved: {', '.join(tables)}
+Relationships found: {len(relationships)}
+
+SQL: {sql[:600]}...
+
+Identify potential data integrity issues based on the relationships:
+1. Are there potential orphaned records?
+2. Are there missing foreign key constraints?
+3. Are there circular dependencies?
+4. Any unusual join patterns?
+
+Respond in JSON:
+{{"integrity_issues": [{{"type": "orphaned_records", "severity": "high", "description": "...", "affected_tables": ["table1", "table2"]}}], "relationship_quality": "good|concerning|problematic"}}"""
+
+            response = answer_from_ollama(prompt, self.config.llm_model)
+            return json.loads(response)
+        except Exception as e:
+            logging.error(f"LLM relationship analysis failed: {e}")
+            return {}
+    
+    def _analyze_joins_with_llm(self, sql: str, join_analysis: Dict) -> Dict[str, Any]:
+        """LLM analysis for complex join patterns"""
+        try:
+            join_patterns = join_analysis.get('join_patterns', [])
+            
+            if not join_patterns:
+                return {}
+            
+            pattern_desc = []
+            for pattern in join_patterns[:5]:  # Limit to first 5
+                pattern_desc.append(f"{pattern.get('source_table')}.{pattern.get('source_column')} -> {pattern.get('target_table')}.{pattern.get('target_column')} ({pattern.get('join_type')})")
+            
+            prompt = f"""Analyze these join patterns for potential issues:
+
+Join Patterns:
+{chr(10).join(pattern_desc)}
+
+SQL: {sql[:600]}...
+
+Identify:
+1. Are these appropriate join patterns?
+2. Any missing foreign key constraints?
+3. Performance concerns?
+4. Data integrity risks?
+
+Respond in JSON:
+{{"join_quality_assessment": "good|concerning|problematic", "issues": [{{"type": "missing_fk", "description": "...", "recommendation": "..."}}]}}"""
+
+            response = answer_from_ollama(prompt, self.config.llm_model)
+            return json.loads(response)
+        except Exception as e:
+            logging.error(f"LLM join analysis failed: {e}")
+            return {}
     
     def process_all_batches(self) -> List[Dict[str, Any]]:
         """Process all batches in the file"""
@@ -456,17 +591,49 @@ def comprehensive_analysis(csv_path: str, batch_size: int = 2000) -> Dict[str, A
     analyzer = VSQLAnalyzer(config)
     return analyzer.run_full_analysis()
 
+def force_llm_analysis(csv_path: str, batch_size: int = 100, max_batches: int = 1) -> Dict[str, Any]:
+    """Force LLM analysis on all SQL statements (good for testing LLM integration)"""
+    config = create_analysis_config(
+        csv_path=csv_path,
+        batch_size=batch_size,
+        max_batches=max_batches,
+        analysis_types=["pattern"],
+        force_llm_analysis=True,  # This will force LLM usage
+        skip_duplicates=False,  # Don't skip duplicates for testing
+        output_dir="./llm_test_analysis"
+    )
+    
+    analyzer = VSQLAnalyzer(config)
+    return analyzer.run_full_analysis()
+
+def llm_heavy_analysis(csv_path: str, batch_size: int = 1000, max_batches: int = 5) -> Dict[str, Any]:
+    """Run analysis with heavy LLM usage (low confidence threshold)"""
+    config = create_analysis_config(
+        csv_path=csv_path,
+        batch_size=batch_size,
+        max_batches=max_batches,
+        analysis_types=["pattern", "relationship", "join"],
+        force_llm_analysis=False,
+        llm_threshold=0.3,  # Very low threshold = more LLM usage
+        output_dir="./llm_heavy_analysis"
+    )
+    
+    analyzer = VSQLAnalyzer(config)
+    return analyzer.run_full_analysis()
+
 # Example usage patterns
 if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser(description='V$SQL Analysis Framework')
     parser.add_argument('csv_path', help='Path to v$sql CSV file')
-    parser.add_argument('--mode', choices=['test', 'integrity', 'relationships', 'comprehensive'], 
+    parser.add_argument('--mode', choices=['test', 'integrity', 'relationships', 'comprehensive', 'force_llm', 'llm_heavy'], 
                        default='test', help='Analysis mode')
     parser.add_argument('--batch-size', type=int, default=1000, help='Batch size')
     parser.add_argument('--max-batches', type=int, help='Maximum number of batches')
     parser.add_argument('--output-dir', default='./analysis_output', help='Output directory')
+    parser.add_argument('--force-llm', action='store_true', help='Force LLM analysis for all SQL')
+    parser.add_argument('--llm-threshold', type=float, default=0.7, help='Confidence threshold for LLM fallback')
     
     args = parser.parse_args()
     
@@ -497,5 +664,23 @@ if __name__ == "__main__":
             args.csv_path,
             batch_size=args.batch_size
         )
+    
+    elif args.mode == 'force_llm':
+        print("Running FORCED LLM analysis (testing LLM integration)...")
+        results = force_llm_analysis(
+            args.csv_path,
+            batch_size=args.batch_size,
+            max_batches=args.max_batches or 1
+        )
+        print(f"LLM calls made: {results.get('total_llm_calls', 0)}")
+        
+    elif args.mode == 'llm_heavy':
+        print("Running LLM-heavy analysis...")
+        results = llm_heavy_analysis(
+            args.csv_path,
+            batch_size=args.batch_size,
+            max_batches=args.max_batches
+        )
+        print(f"LLM calls made: {results.get('total_llm_calls', 0)}")
     
     print("\nAnalysis complete!")
