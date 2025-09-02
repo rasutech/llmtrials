@@ -13,9 +13,28 @@ This framework processes v$sql export data to:
 
 ## Quick Start
 
-### 1. Test Framework Efficacy
+### 1. Test LLM Integration First
 
-Start with a small test to validate the approach:
+**IMPORTANT**: Test LLM integration before processing your data:
+å
+```python
+# Run the LLM integration test
+python test_llm_integration.py
+```
+
+Or test with your actual data:
+
+```python
+from vsql_analyzer import force_llm_analysis
+
+# Force LLM analysis on first 100 records
+results = force_llm_analysis('your_vsql.csv', batch_size=100, max_batches=1)
+print(f"LLM calls made: {results['total_llm_calls']}")
+```
+
+### 2. Test Framework Efficacy
+
+After confirming LLM works, test batch processing:
 
 ```python
 from vsql_analyzer import test_microbatch_efficacy
@@ -25,7 +44,7 @@ results = test_microbatch_efficacy('your_vsql.csv')
 print("Optimal batch size determined from test results")
 ```
 
-### 2. Analyze Integrity Patterns (Fast)
+### 3. Analyze Integrity Patterns (Fast)
 
 Focus on identifying data integrity issues:
 
@@ -40,7 +59,7 @@ results = analyze_integrity_patterns(
 )
 ```
 
-### 3. Discover Table Relationships (Detailed)
+### 4. Discover Table Relationships (Detailed)
 
 Understand how tables are connected:
 
@@ -55,7 +74,7 @@ results = discover_table_relationships(
 )
 ```
 
-### 4. Comprehensive Analysis
+### 5. Comprehensive Analysis
 
 Run all analysis types:
 
@@ -74,14 +93,20 @@ results = comprehensive_analysis(
 The framework includes a command-line interface:
 
 ```bash
+# Test LLM integration first
+python test_llm_integration.py
+
+# Force LLM analysis on 100 records
+python vsql_analyzer.py your_vsql.csv --mode force_llm --batch-size 100 --max-batches 1
+
 # Test efficacy with different batch sizes
 python vsql_analyzer.py your_vsql.csv --mode test --output-dir ./test_results
 
 # Analyze integrity patterns
 python vsql_analyzer.py your_vsql.csv --mode integrity --batch-size 1000 --max-batches 10
 
-# Discover relationships
-python vsql_analyzer.py your_vsql.csv --mode relationships --batch-size 5000 --max-batches 5
+# LLM-heavy analysis (low confidence threshold)
+python vsql_analyzer.py your_vsql.csv --mode llm_heavy --batch-size 1000 --max-batches 5
 
 # Comprehensive analysis
 python vsql_analyzer.py your_vsql.csv --mode comprehensive --batch-size 2000
