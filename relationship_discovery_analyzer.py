@@ -5,7 +5,7 @@ import time
 import threading
 import queue
 from typing import Dict, List, Set, Tuple, Optional, Any, DefaultDict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, fieldå
 from collections import defaultdict, Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -117,18 +117,31 @@ class RelationshipDiscoveryEngine:
             'operation_type': self._get_operation_type(sql)
         }
         
-        # Only analyze SELECT statements for relationships
-        if analysis['operation_type'] != 'SELECT':
-            return self._analyze_non_select(sql, analysis)
-        
-        # Extract JOIN relationships
-        self._extract_join_relationships(sql, analysis)
-        
-        # Extract table.column references
-        self._extract_column_references(sql, analysis)
-        
-        # Extract filter conditions
-        self._extract_filter_conditions(sql, analysis)
+        # Try LLM-based analysis first for better accuracy
+        llm_analysis = self._analyze_with_llm(sql, sql_id)
+        if llm_analysis and llm_analysis.get('success'):
+            # Use LLM results
+            analysis['tables'] = set(llm_analysis.get('tables', []))
+            analysis['relationships'] = llm_analysis.get('relationships', [])
+            analysis['columns_used'] = defaultdict(set, llm_analysis.get('columns_used', {}))
+            analysis['filter_columns'] = defaultdict(set, llm_analysis.get('filter_columns', {}))
+            logger.debug(f"Used LLM analysis for SQL {sql_id}")
+        else:
+            # Fallback to regex-based analysis
+            logger.debug(f"Using regex fallback for SQL {sql_id}")
+            
+            # Only analyze SELECT statements for relationships
+            if analysis['operation_type'] != 'SELECT':
+                return self._analyze_non_select(sql, analysis)
+            
+            # Extract JOIN relationships
+            self._extract_join_relationships(sql, analysis)
+            
+            # Extract table.column references
+            self._extract_column_references(sql, analysis)
+            
+            # Extract filter conditions
+            self._extract_filter_conditions(sql, analysis)
         
         # Update table profiles
         self._update_table_profiles(analysis, sql)
@@ -258,6 +271,90 @@ class RelationshipDiscoveryEngine:
             profile = self._ensure_table_profile(table)
             profile.common_filter_columns[column] += 1
     
+    def _analyze_with_llm(self, sql: str, sql_id: str) -> Dict[str, Any]:
+        """Analyze SQL using LLM for better accuracy"""
+        try:
+            # Truncate SQL for LLM processing
+            sql_truncated = sql[:1200] if len(sql) > 1200 else sql
+            
+            prompt = f"""Analyze this SQL statement and extract table relationships, columns, and joins:
+
+SQL ID: {sql_id}
+SQL: {sql_truncated}
+
+Please identify:
+1. All tables mentioned in the query
+2. All relationships (joins) between tables
+3. Columns used from each table
+4. Filter/WHERE conditions with columns
+
+Return JSON format:
+{{
+  "success": true,
+  "tables": ["TABLE1", "TABLE2", "TABLE3"],
+  "relationships": [
+    {{
+      "source_table": "TABLE1",
+      "target_table": "TABLE2", 
+      "join_type": "INNER|LEFT|RIGHT|FULL",
+      "join_columns": [["COL1", "COL2"]]
+    }}
+  ],
+  "columns_used": {{
+    "TABLE1": ["COL1", "COL2"],
+    "TABLE2": ["COL3", "COL4"]
+  }},
+  "filter_columns": {{
+    "TABLE1": ["COL1"],
+    "TABLE2": ["COL3"]
+  }}
+}}
+
+Focus on accurate table and column identification. Use uppercase for table/column names."""
+
+            response = answer_from_ollama(prompt, "mistral-nemo:latest")
+            result = json.loads(response)
+            
+            # Validate and clean the result
+            if result.get('success'):
+                # Ensure all table names are uppercase
+                if 'tables' in result:
+                    result['tables'] = [t.upper() for t in result['tables']]
+                
+                # Clean relationships
+                if 'relationships' in result:
+                    for rel in result['relationships']:
+                        if 'source_table' in rel:
+                            rel['source_table'] = rel['source_table'].upper()
+                        if 'target_table' in rel:
+                            rel['target_table'] = rel['target_table'].upper()
+                        if 'join_columns' in rel:
+                            rel['join_columns'] = [
+                                (c1.upper(), c2.upper()) if isinstance(c, list) and len(c) == 2 
+                                else c for c in rel['join_columns']
+                                for c1, c2 in [c] if isinstance(c, list) and len(c) == 2
+                            ]
+                
+                # Clean columns_used
+                if 'columns_used' in result:
+                    result['columns_used'] = {
+                        table.upper(): [col.upper() for col in cols]
+                        for table, cols in result['columns_used'].items()
+                    }
+                
+                # Clean filter_columns  
+                if 'filter_columns' in result:
+                    result['filter_columns'] = {
+                        table.upper(): [col.upper() for col in cols]
+                        for table, cols in result['filter_columns'].items()
+                    }
+            
+            return result
+            
+        except Exception as e:
+            logger.warning(f"LLM analysis failed for SQL {sql_id}: {e}")
+            return {'success': False, 'error': str(e)}
+    
     def _ensure_table_profile(self, table: str) -> TableProfile:
         """Ensure table profile exists"""
         if table not in self.table_profiles:
@@ -272,10 +369,30 @@ class RelationshipDiscoveryEngine:
             if analysis['operation_type'] == 'SELECT':
                 profile.select_frequency += 1
         
+        # Update columns from LLM or regex analysis
+        for table, columns in analysis['columns_used'].items():
+            profile = self._ensure_table_profile(table)
+            if isinstance(columns, set):
+                profile.columns.update(columns)
+            elif isinstance(columns, list):
+                profile.columns.update(columns)
+        
+        # Update filter columns
+        for table, filter_cols in analysis['filter_columns'].items():
+            profile = self._ensure_table_profile(table)
+            if isinstance(filter_cols, set):
+                for col in filter_cols:
+                    profile.common_filter_columns[col] += 1
+            elif isinstance(filter_cols, list):
+                for col in filter_cols:
+                    profile.common_filter_columns[col] += 1
+        
         # Update relationships
         for rel_data in analysis['relationships']:
             source = rel_data['source_table']
             target = rel_data['target_table']
+            join_columns = rel_data.get('join_columns', [])
+            join_type = rel_data.get('join_type', 'INNER')
             
             # Create or update relationship
             key = (source, target)
@@ -283,15 +400,15 @@ class RelationshipDiscoveryEngine:
                 self.relationships[key] = TableRelationship(
                     source_table=source,
                     target_table=target,
-                    join_columns=rel_data['join_columns'],
-                    join_type=rel_data['join_type']
+                    join_columns=join_columns,
+                    join_type=join_type
                 )
             else:
                 # Update existing relationship
                 self.relationships[key].frequency += 1
                 # Merge join columns
                 existing_joins = set(self.relationships[key].join_columns)
-                new_joins = set(rel_data['join_columns'])
+                new_joins = set(join_columns)
                 self.relationships[key].join_columns = list(existing_joins | new_joins)
             
             # Add example SQL (limit to 3)
@@ -301,8 +418,8 @@ class RelationshipDiscoveryEngine:
             # Update graph
             self.relationship_graph.add_edge(
                 source, target,
-                join_columns=rel_data['join_columns'],
-                join_type=rel_data['join_type']
+                join_columns=join_columns,
+                join_type=join_type
             )
             
             # Update profiles
@@ -310,7 +427,7 @@ class RelationshipDiscoveryEngine:
             self._ensure_table_profile(target).join_frequency += 1
             
             # Track join columns
-            for src_col, tgt_col in rel_data['join_columns']:
+            for src_col, tgt_col in join_columns:
                 self._ensure_table_profile(source).common_join_columns[src_col] += 1
                 self._ensure_table_profile(target).common_join_columns[tgt_col] += 1
 
