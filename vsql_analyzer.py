@@ -45,6 +45,7 @@ class AnalysisConfig:
     enable_caching: bool = True
     analysis_types: List[str] = field(default_factory=lambda: ["pattern", "relationship", "join"])
     force_llm_analysis: bool = False  # Force LLM for all SQL statements
+    force_llm_relationships: bool = False  # Force LLM for relationship analysis
     llm_threshold: float = 0.7  # Confidence threshold for LLM fallback
 
 class SQLDeduplicator:
@@ -253,6 +254,10 @@ class BatchProcessor:
             if rel_engine and not test_mode:
                 rel_analysis = rel_engine.analyze_sql(sql, sql_id)
                 record_result['analysis']['relationships'] = rel_analysis
+                
+                # Count LLM calls if LLM was used for relationship analysis
+                if any('LLM analysis' in str(rel_analysis.get('debug', ''))) or self.config.force_llm_analysis:
+                    batch_stats['llm_calls'] += 1
                 
                 # Add LLM analysis for complex relationships
                 if len(rel_analysis.get('relationships', [])) > 2:
@@ -621,13 +626,28 @@ def llm_heavy_analysis(csv_path: str, batch_size: int = 1000, max_batches: int =
     analyzer = VSQLAnalyzer(config)
     return analyzer.run_full_analysis()
 
+def llm_relationship_analysis(csv_path: str, batch_size: int = 1000, max_batches: int = 5) -> Dict[str, Any]:
+    """Run analysis with LLM-based relationship identification for better accuracy"""
+    config = create_analysis_config(
+        csv_path=csv_path,
+        batch_size=batch_size,
+        max_batches=max_batches,
+        analysis_types=["relationship", "join"],
+        force_llm_relationships=True,  # Force LLM for relationships
+        skip_duplicates=True,
+        output_dir="./llm_relationship_analysis"
+    )
+    
+    analyzer = VSQLAnalyzer(config)
+    return analyzer.run_full_analysis()
+
 # Example usage patterns
 if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser(description='V$SQL Analysis Framework')
     parser.add_argument('csv_path', help='Path to v$sql CSV file')
-    parser.add_argument('--mode', choices=['test', 'integrity', 'relationships', 'comprehensive', 'force_llm', 'llm_heavy'], 
+    parser.add_argument('--mode', choices=['test', 'integrity', 'relationships', 'comprehensive', 'force_llm', 'llm_heavy', 'llm_relationships'], 
                        default='test', help='Analysis mode')
     parser.add_argument('--batch-size', type=int, default=1000, help='Batch size')
     parser.add_argument('--max-batches', type=int, help='Maximum number of batches')
@@ -677,6 +697,15 @@ if __name__ == "__main__":
     elif args.mode == 'llm_heavy':
         print("Running LLM-heavy analysis...")
         results = llm_heavy_analysis(
+            args.csv_path,
+            batch_size=args.batch_size,
+            max_batches=args.max_batches
+        )
+        print(f"LLM calls made: {results.get('total_llm_calls', 0)}")
+        
+    elif args.mode == 'llm_relationships':
+        print("Running LLM-based relationship analysis...")
+        results = llm_relationship_analysis(
             args.csv_path,
             batch_size=args.batch_size,
             max_batches=args.max_batches
