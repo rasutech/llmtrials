@@ -205,7 +205,7 @@ class BatchProcessor:
         
         if 'relationship' in self.config.analysis_types and not test_mode:
             from relationship_discovery_analyzer import RelationshipDiscoveryEngine
-            rel_engine = RelationshipDiscoveryEngine()
+            rel_engine = RelationshipDiscoveryEngine(llm_model=self.config.llm_model)
         
         if 'join' in self.config.analysis_types and not test_mode:
             join_engine = JoinFieldDiscoveryEngine()
@@ -256,7 +256,7 @@ class BatchProcessor:
                 record_result['analysis']['relationships'] = rel_analysis
                 
                 # Count LLM calls if LLM was used for relationship analysis
-                if any('LLM analysis' in str(rel_analysis.get('debug', ''))) or self.config.force_llm_analysis:
+                if 'LLM analysis' in str(rel_analysis.get('debug', '')) or self.config.force_llm_analysis:
                     batch_stats['llm_calls'] += 1
                 
                 # Add LLM analysis for complex relationships
