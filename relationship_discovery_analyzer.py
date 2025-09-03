@@ -9,7 +9,7 @@ from dataclasses import dataclass, fieldå
 from collections import defaultdict, Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-import logging
+import loggingå
 import networkx as nx
 import matplotlib.pyplot as plt
 import numpy as np
@@ -72,11 +72,12 @@ class PotentialIntegrityIssue:
 class RelationshipDiscoveryEngine:
     """Discovers table relationships from SELECT queries"""
     
-    def __init__(self):
+    def __init__(self, llm_model: str = "mistral-nemo:latest"):
         self.table_profiles: Dict[str, TableProfile] = {}
         self.relationships: Dict[Tuple[str, str], TableRelationship] = {}
         self.relationship_graph = nx.MultiDiGraph()
         self.sql_patterns = self._compile_patterns()
+        self.llm_model = llm_model
         
     def _compile_patterns(self) -> Dict[str, re.Pattern]:
         """Compile regex patterns for SQL analysis"""
@@ -277,26 +278,28 @@ class RelationshipDiscoveryEngine:
             # Truncate SQL for LLM processing
             sql_truncated = sql[:1200] if len(sql) > 1200 else sql
             
-            prompt = f"""Analyze this SQL statement and extract table relationships, columns, and joins:
+            prompt = f"""You are a SQL parser. Analyze this SQL statement and extract table relationships, columns, and joins.
 
 SQL ID: {sql_id}
 SQL: {sql_truncated}
 
-Please identify:
+IMPORTANT: Respond ONLY with valid JSON. No explanations, no markdown, no extra text.
+
+Identify:
 1. All tables mentioned in the query
-2. All relationships (joins) between tables
+2. All relationships (joins) between tables  
 3. Columns used from each table
 4. Filter/WHERE conditions with columns
 
-Return JSON format:
+Expected JSON format:
 {{
   "success": true,
-  "tables": ["TABLE1", "TABLE2", "TABLE3"],
+  "tables": ["TABLE1", "TABLE2"],
   "relationships": [
     {{
       "source_table": "TABLE1",
       "target_table": "TABLE2", 
-      "join_type": "INNER|LEFT|RIGHT|FULL",
+      "join_type": "INNER",
       "join_columns": [["COL1", "COL2"]]
     }}
   ],
@@ -310,10 +313,47 @@ Return JSON format:
   }}
 }}
 
-Focus on accurate table and column identification. Use uppercase for table/column names."""
+Use uppercase for table/column names. Return ONLY the JSON object."""
 
-            response = answer_from_ollama(prompt, "mistral-nemo:latest")
-            result = json.loads(response)
+            response = answer_from_ollama(prompt, self.llm_model)
+            
+            # Better debugging - log the actual response
+            logger.info(f"LLM response for {sql_id} (first 200 chars): {response[:200]}")
+            
+            # Clean the response to extract JSON
+            response_cleaned = response.strip()
+            
+            # Try to find JSON in the response
+            if not response_cleaned:
+                logger.warning(f"Empty response from LLM for {sql_id}")
+                raise ValueError("Empty response from LLM")
+            
+            # Look for JSON block markers
+            if '```json' in response_cleaned:
+                start = response_cleaned.find('```json') + 7
+                end = response_cleaned.find('```', start)
+                if end > start:
+                    response_cleaned = response_cleaned[start:end].strip()
+                    logger.debug(f"Extracted JSON from markdown block for {sql_id}")
+            elif '```' in response_cleaned:
+                start = response_cleaned.find('```') + 3
+                end = response_cleaned.find('```', start)
+                if end > start:
+                    response_cleaned = response_cleaned[start:end].strip()
+                    logger.debug(f"Extracted content from code block for {sql_id}")
+            
+            # Try to find JSON object
+            if '{' in response_cleaned and '}' in response_cleaned:
+                start = response_cleaned.find('{')
+                end = response_cleaned.rfind('}') + 1
+                response_cleaned = response_cleaned[start:end]
+                logger.debug(f"Extracted JSON object for {sql_id}")
+            else:
+                logger.warning(f"No JSON object found in response for {sql_id}: {response_cleaned}")
+                raise ValueError("No JSON object found in response")
+            
+            logger.debug(f"Cleaned JSON for {sql_id}: {response_cleaned}")
+            result = json.loads(response_cleaned)
             
             # Validate and clean the result
             if result.get('success'):
