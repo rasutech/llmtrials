@@ -16,7 +16,7 @@ This framework processes v$sql export data to:
 ### 1. Test LLM Integration First
 
 **IMPORTANT**: Test LLM integration before processing your data:
-å
+
 ```python
 # Run the LLM integration test
 python test_llm_integration.py
